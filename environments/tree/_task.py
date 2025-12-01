@@ -1,7 +1,7 @@
 """Tree Reconstruction Task implementation.
 
-This module provides the task interface for tree reconstruction,
-following the affinetes Challenge/Response pattern.
+Provides the task interface for tree reconstruction following the affinetes
+Challenge/Response pattern.
 """
 
 import re
@@ -10,8 +10,7 @@ import math
 from typing import Optional, List, Tuple
 from dataclasses import dataclass
 
-from _hidden_tree import HiddenTree
-from _session import SessionManager, get_session_manager
+from ._session import SessionManager, get_session_manager
 
 
 @dataclass
@@ -65,13 +64,15 @@ class TreeReconstructionTask:
         r'SUBMIT\s+([\d\s,\-]+)',
         re.IGNORECASE
     )
+    MAX_TURNS = 100
 
     def __init__(
         self,
         default_n: int = 20,
         default_method: str = "prufer",
         max_queries: Optional[int] = None,
-        allowed_query_types: Optional[List[str]] = None
+        allowed_query_types: Optional[List[str]] = None,
+        session_manager: Optional[SessionManager] = None
     ):
         """Initialize the task.
 
@@ -85,7 +86,7 @@ class TreeReconstructionTask:
         self.default_method = default_method
         self.max_queries = max_queries
         self.allowed_query_types = allowed_query_types or ["ANCESTOR", "LCA", "DEPTH", "CHILDREN", "PATH"]
-        self.session_manager = get_session_manager()
+        self.session_manager = session_manager or get_session_manager()
 
     async def generate(
         self,

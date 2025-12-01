@@ -1,29 +1,13 @@
-"""Tree Deduction - Principled partial observation model.
-
-The task: Given partial observations about a hidden tree, deduce the parent array.
-
-Design Principle:
-- Two parameters only: n (size) and reveal_fraction (difficulty)
-- reveal_fraction ∈ [0, 1] controls what fraction of edges are directly revealed
-- Depths are always given (makes the problem tractable)
-- No arbitrary presets - difficulty emerges from the math
-
-Information Theory:
-- With depths known, each node at depth d has |{nodes at depth d-1}| parent choices
-- reveal_fraction=1.0: all edges given, trivial (just read the answer)
-- reveal_fraction=0.0: only depths given, must deduce from structure alone
-- reveal_fraction=0.5: half edges given, deduce the rest
-
-The elegance: difficulty scales continuously and meaningfully.
-"""
+"""Tree Deduction - Principled partial observation model."""
 
 import random
 import math
+import re
 from typing import List, Tuple, Optional, Dict, Set
 from dataclasses import dataclass, field
 from collections import defaultdict
 
-from _hidden_tree import HiddenTree
+from ._hidden_tree import HiddenTree
 
 
 @dataclass
@@ -291,3 +275,69 @@ def evaluate_answer(answer: List[int], problem: DeductionProblem) -> dict:
         "errors": errors,
         "hidden_nodes": hidden
     }
+
+
+class TreeDeductionTask:
+    """Single-turn tree deduction from partial observations."""
+
+    ANSWER_PATTERN = re.compile(r"(?:ANSWER|SUBMIT|SOLUTION)[:\s]*([\d\s,\-]+)", re.IGNORECASE)
+
+    def __init__(self, n: int = 8, reveal_fraction: float = 0.5):
+        self.n = n
+        self.reveal_fraction = reveal_fraction
+
+    async def generate(
+        self,
+        n: Optional[int] = None,
+        reveal_fraction: Optional[float] = None,
+        seed: Optional[int] = None,
+        task_id: Optional[int] = None,
+    ) -> DeductionProblem:
+        """Generate a problem instance."""
+        n = n if n is not None else self.n
+        reveal_fraction = reveal_fraction if reveal_fraction is not None else self.reveal_fraction
+        seed = seed if seed is not None else (task_id if task_id is not None else random.randint(0, 2**63 - 1))
+        return generate_problem(n, reveal_fraction, seed)
+
+    async def evaluate(self, response: str, problem: DeductionProblem) -> float:
+        answer = self._parse(response, problem.n)
+        if answer is None:
+            return 0.0
+        return evaluate_answer(answer, problem)["score"]
+
+    def evaluate_detailed(self, response: str, problem: DeductionProblem) -> dict:
+        answer = self._parse(response, problem.n)
+        if answer is None:
+            return {"score": 0.0, "parse_error": True}
+        result = evaluate_answer(answer, problem)
+        result["predicted"] = answer
+        return result
+
+    def _parse(self, response: str, n: int) -> Optional[List[int]]:
+        # Pattern-based extraction
+        match = self.ANSWER_PATTERN.search(response)
+        if match:
+            values = [int(x) for x in re.findall(r"-?\d+", match.group(1))]
+            return self._normalize(values, n)
+
+        # Bracketed array
+        for m in re.finditer(r"\[([^\]]+)\]", response):
+            values = [int(x) for x in re.findall(r"-?\d+", m.group(1))]
+            if len(values) >= n - 1:
+                return self._normalize(values, n)
+
+        # Last line containing enough numbers
+        for line in reversed(response.strip().split("\n")):
+            values = [int(x) for x in re.findall(r"-?\d+", line)]
+            if len(values) >= n - 1:
+                return self._normalize(values, n)
+        return None
+
+    def _normalize(self, values: List[int], n: int) -> List[int]:
+        if len(values) == n - 1:
+            return [-1] + values
+        if len(values) == n:
+            return values
+        if len(values) > n:
+            return values[:n]
+        return values + [-1] * (n - len(values))

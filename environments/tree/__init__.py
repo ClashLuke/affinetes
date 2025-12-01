@@ -17,9 +17,9 @@ Usage:
     )
 """
 
-from env import Actor
-from _hidden_tree import HiddenTree
-from _deduction import (
+from .env import Actor
+from ._hidden_tree import HiddenTree
+from ._deduction import (
     generate_problem,
     generate_observations,
     evaluate_answer,
@@ -27,8 +27,8 @@ from _deduction import (
     DeductionProblem,
     TreeObservations,
     Observation,
+    TreeDeductionTask,
 )
-from _deduction_task import TreeDeductionTask
 
 __all__ = [
     "Actor",

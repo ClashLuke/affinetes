@@ -1,116 +1,180 @@
-"""Tree Environment Actor.
+"""Tree environment actor – compact, principled entrypoint."""
 
-This module provides the main Actor class for tree tasks,
-following the affinetes pattern.
+from __future__ import annotations
 
-Supported tasks:
-1. Tree Deduction (recommended): Single-turn reasoning from partial observations
-2. Tree Reconstruction: Multi-turn interactive querying (legacy)
-"""
-
-import os
-import time
 import gc
+import os
 import random
-import re
 import sys
-import httpx
-import openai
+import time
+from typing import List, Optional, Tuple
 
 # Add /app to path for container imports
-if '/app' not in sys.path:
-    sys.path.insert(0, '/app')
+if "/app" not in sys.path:
+    sys.path.insert(0, "/app")
 
-from _task import TreeReconstructionTask
-from _deduction_task import TreeDeductionTask
-from _session import get_session_manager
-from _models import Challenge
+from ._task import TreeReconstructionTask, TreeChallenge
+from ._session import get_session_manager
+from ._deduction import TreeDeductionTask
 
+
+class LLMConfig:
+    """LLM call configuration."""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str,
+        timeout: int,
+        temperature: float,
+        api_key: str,
+        seed: Optional[int] = None,
+    ):
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.temperature = temperature
+        self.api_key = api_key
+        self.seed = seed
+
+
+async def chat(messages: List[dict], config: LLMConfig) -> str:
+    """Minimal OpenAI-compatible chat helper."""
+    import httpx
+    import openai
+
+    os.environ.pop("SSL_CERT_FILE", None)
+    os.environ.pop("REQUESTS_CA_BUNDLE", None)
+
+    client = openai.AsyncOpenAI(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        timeout=httpx.Timeout(config.timeout),
+        max_retries=0,
+    )
+
+    params = {
+        "model": config.model,
+        "messages": messages,
+        "temperature": config.temperature,
+        "stream": False,
+    }
+    if config.seed is not None:
+        params["seed"] = config.seed
+
+    response = await client.chat.completions.create(**params)
+    if not response.choices or response.choices[0].message.content is None:
+        raise ValueError("LLM API returned no content")
+    return response.choices[0].message.content.strip()
+
+
+# --- reconstruction helpers -------------------------------------------------
+
+def _parse_queries(response: str) -> List[Tuple[str, List[int]]]:
+    out: List[Tuple[str, List[int]]] = []
+    for match in TreeReconstructionTask.QUERY_PATTERN.finditer(response):
+        args = [int(match.group(2))]
+        if match.group(3):
+            args.append(int(match.group(3)))
+        out.append((match.group(1).upper(), args))
+    return out
+
+
+def _format_query(query_type: str, args: List[int], result: dict) -> str:
+    value = result["result"]
+    if query_type == "ANCESTOR":
+        answer = "YES" if value else "NO"
+    elif query_type in ("CHILDREN", "PATH"):
+        answer = "[" + ", ".join(map(str, value)) + "]"
+    else:
+        answer = str(value)
+    return f"{query_type} {' '.join(map(str, args))}: {answer}"
+
+
+async def _run_multi_turn(task: TreeReconstructionTask, challenge: TreeChallenge, convo: List[dict], config: LLMConfig):
+    sm = task.session_manager
+    for _ in range(TreeReconstructionTask.MAX_TURNS):
+        response = await chat(convo, config)
+        convo.append({"role": "assistant", "content": response})
+
+        feedback: List[str] = []
+        for qtype, args in _parse_queries(response):
+            try:
+                feedback.append(_format_query(qtype, args, sm.query(challenge.session_id, qtype, args)))
+            except ValueError as exc:
+                feedback.append(f"Error: {exc}")
+
+        done = False
+        result = None
+        submit_msg = None
+        if task.SUBMIT_PATTERN.search(response):
+            submit_msg, done, result = await task.process_response(challenge.session_id, response)
+
+        if feedback or submit_msg:
+            combined = feedback + ([submit_msg] if submit_msg else [])
+            convo.append({"role": "user", "content": "\n".join(combined)})
+
+        if done:
+            score = result.get("score", 0.0) if result else 0.0
+            return score, result
+
+    return 0.0, {"error": "max_turns_reached"}
+
+
+async def _run_single_turn(task: TreeReconstructionTask, challenge: TreeChallenge, convo: List[dict], config: LLMConfig):
+    sm = task.session_manager
+    response = await chat(convo, config)
+    convo.append({"role": "assistant", "content": response})
+
+    for qtype, args in _parse_queries(response):
+        try:
+            sm.query(challenge.session_id, qtype, args)
+        except ValueError:
+            continue
+
+    score = await task.evaluate(response, challenge)
+    try:
+        state = sm.get_session_state(challenge.session_id)
+        final = {
+            "score": score,
+            "query_count": state.get("query_count", 0),
+            "total_bits": state.get("total_bits", 0),
+            "status": state.get("status", "unknown"),
+        }
+    except ValueError:
+        final = {"score": score}
+
+    return score, final
+
+
+# --- Actor ------------------------------------------------------------------
 
 class Actor:
-    """Tree Reconstruction evaluation actor.
+    """Thin façade delegating to reconstruction or deduction tasks."""
 
-    This actor supports evaluation in two modes:
-
-    1. Single-turn mode (default):
-       - Generate challenge prompt
-       - Agent outputs queries and submission in one response
-       - Parse and execute queries, evaluate submission
-
-    2. Multi-turn mode:
-       - Generate challenge prompt
-       - Agent and environment exchange messages
-       - Agent terminates by submitting reconstruction
-
-    The multi-turn mode is more natural for this task but requires
-    special handling in the evaluation loop.
-    """
-
-    # Maximum turns for multi-turn evaluation
-    MAX_TURNS = 100
-
-    # Patterns for parsing
-    QUERY_PATTERN = re.compile(
-        r'QUERY\s+(ANCESTOR|LCA|DEPTH|CHILDREN|PATH)\s+(\d+)(?:\s+(\d+))?',
-        re.IGNORECASE
-    )
-    SUBMIT_PATTERN = re.compile(
-        r'SUBMIT\s+([\d\s,\-]+)',
-        re.IGNORECASE
-    )
-
-    def __init__(self, api_key: str = None):
-        """Initialize Actor.
-
-        Args:
-            api_key: API key for LLM service. Uses CHUTES_API_KEY env var if not provided.
-        """
+    def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("CHUTES_API_KEY")
         self.session_manager = get_session_manager()
 
-    async def _llm_chat(
+    def _llm_config(
         self,
-        messages,
-        model,
-        base_url,
-        timeout,
-        temperature,
-        current_api_key,
-        seed=None
-    ):
-        """Call LLM API with conversation history."""
-        # Unset SSL_CERT_FILE to avoid certificate issues in container
-        os.environ.pop('SSL_CERT_FILE', None)
-        os.environ.pop('REQUESTS_CA_BUNDLE', None)
-
-        client = openai.AsyncOpenAI(
-            base_url=base_url.rstrip('/'),
-            api_key=current_api_key,
-            timeout=httpx.Timeout(timeout),
-            max_retries=0
+        model: str,
+        base_url: str,
+        timeout: int,
+        temperature: float,
+        api_key: Optional[str],
+        seed: Optional[int],
+    ) -> LLMConfig:
+        return LLMConfig(
+            model=model,
+            base_url=base_url,
+            timeout=timeout,
+            temperature=temperature,
+            api_key=api_key or self.api_key,
+            seed=seed,
         )
 
-        params = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "stream": False
-        }
-
-        if seed is not None:
-            params["seed"] = seed
-
-        response = await client.chat.completions.create(**params)
-
-        if not response.choices:
-            raise ValueError("LLM API returned empty choices list")
-
-        content = response.choices[0].message.content
-        if content is None:
-            raise ValueError("LLM API returned None content")
-
-        return content.strip()
-
+    # Reconstruction -----------------------------------------------------
     async def evaluate(
         self,
         n: int = 20,
@@ -119,69 +183,44 @@ class Actor:
         base_url: str = "https://llm.chutes.ai/v1",
         timeout: int = 600,
         temperature: float = 0.7,
-        api_key: str = None,
-        seed: int = None,
-        task_id: int = None,
-        max_queries: int = None,
-        allowed_query_types: list = None,
-        multi_turn: bool = True
+        api_key: Optional[str] = None,
+        seed: Optional[int] = None,
+        task_id: Optional[int] = None,
+        max_queries: Optional[int] = None,
+        allowed_query_types: Optional[List[str]] = None,
+        multi_turn: bool = True,
     ):
-        """Run tree reconstruction evaluation.
+        llm_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
+        tree_seed = task_id if task_id is not None else (seed if seed is not None else random.randint(0, 2**63 - 1))
+        llm_config = self._llm_config(model, base_url, timeout, temperature, api_key, llm_seed)
 
-        Args:
-            n: Number of nodes in the tree
-            method: Generation method ("prufer" for uniform, "recursive")
-            model: Model name for evaluation
-            base_url: Base URL for LLM API
-            timeout: Timeout for LLM API calls
-            temperature: Temperature for generation
-            api_key: Override API key
-            seed: Random seed for LLM generation
-            task_id: Task ID for deterministic tree generation
-            max_queries: Optional query limit
-            allowed_query_types: Restrict query types (None = all)
-            multi_turn: If True, run multi-turn loop; if False, single response
-
-        Returns:
-            Evaluation result dictionary
-        """
-        if seed is None:
-            seed = random.randint(0, 2**32 - 1)
-
-        current_api_key = api_key or self.api_key
-
-        # Create task with configuration
         task = TreeReconstructionTask(
             default_n=n,
             default_method=method,
             max_queries=max_queries,
-            allowed_query_types=allowed_query_types
+            allowed_query_types=allowed_query_types,
+            session_manager=self.session_manager,
         )
 
         start = time.time()
-
-        # Generate challenge
-        challenge = await task.generate(n=n, seed=task_id, method=method, task_id=task_id)
-
-        conversation = [{"role": "user", "content": challenge.prompt}]
+        challenge = await task.generate(n=n, seed=tree_seed, method=method, task_id=task_id)
+        convo = [{"role": "user", "content": challenge.prompt}]
 
         try:
             if multi_turn:
-                score, final_result = await self._run_multi_turn(
-                    task, challenge, conversation,
-                    model, base_url, timeout, temperature, current_api_key, seed
-                )
+                score, final = await _run_multi_turn(task, challenge, convo, llm_config)
             else:
-                score, final_result = await self._run_single_turn(
-                    task, challenge, conversation,
-                    model, base_url, timeout, temperature, current_api_key, seed
-                )
+                score, final = await _run_single_turn(task, challenge, convo, llm_config)
             error = None
-        except Exception as e:
+        except Exception as exc:  # pragma: no cover
             import traceback
+
             score = 0.0
-            final_result = None
-            error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+            final = None
+            error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+        finally:
+            self.session_manager.close_session(challenge.session_id)
+            gc.collect()
 
         result = {
             "task_name": "tree:reconstruction",
@@ -189,219 +228,48 @@ class Actor:
             "success": score > 0,
             "time_taken": time.time() - start,
             "extra": {
-                "conversation": conversation,
-                "seed": seed,
+                "conversation": convo,
+                "seed": llm_seed,
+                "tree_seed": tree_seed,
                 "task_id": task_id,
                 "n": n,
                 "method": method,
-                "evaluation": final_result
-            }
+                "evaluation": final,
+            },
         }
-
         if error:
             result["error"] = error
             result["error_type"] = "evaluation_failure"
-
-        # Cleanup
-        try:
-            self.session_manager.close_session(challenge.session_id)
-        except:
-            pass
-
-        gc.collect()
         return result
 
-    async def _run_multi_turn(
-        self,
-        task,
-        challenge,
-        conversation,
-        model,
-        base_url,
-        timeout,
-        temperature,
-        api_key,
-        seed
-    ):
-        """Run multi-turn interactive evaluation."""
-        for turn in range(self.MAX_TURNS):
-            # Get LLM response
-            response = await self._llm_chat(
-                conversation, model, base_url, timeout, temperature, api_key, seed
-            )
-            conversation.append({"role": "assistant", "content": response})
-
-            # Process response (may contain multiple queries + submission)
-            result_messages = []
-            is_complete = False
-            final_result = None
-
-            # Process all queries in the response
-            for match in self.QUERY_PATTERN.finditer(response):
-                query_type = match.group(1).upper()
-                args = [int(match.group(2))]
-                if match.group(3):
-                    args.append(int(match.group(3)))
-
-                try:
-                    query_result = self.session_manager.query(
-                        challenge.session_id, query_type, args
-                    )
-                    if query_type == "ANCESTOR":
-                        answer = "YES" if query_result["result"] else "NO"
-                    elif query_type in ("CHILDREN", "PATH"):
-                        answer = "[" + ", ".join(map(str, query_result["result"])) + "]"
-                    else:
-                        answer = str(query_result["result"])
-                    result_messages.append(f"{query_type} {' '.join(map(str, args))}: {answer}")
-                except ValueError as e:
-                    result_messages.append(f"Error: {e}")
-
-            # Check for submission
-            submit_match = self.SUBMIT_PATTERN.search(response)
-            if submit_match:
-                msg, is_complete, final_result = await task.process_response(
-                    challenge.session_id, response
-                )
-                result_messages.append(msg)
-
-            if result_messages:
-                feedback = "\n".join(result_messages)
-                conversation.append({"role": "user", "content": feedback})
-
-            if is_complete:
-                return final_result.get("score", 0.0) if final_result else 0.0, final_result
-
-        # Timeout - max turns reached
-        return 0.0, {"error": "max_turns_reached"}
-
-    async def _run_single_turn(
-        self,
-        task,
-        challenge,
-        conversation,
-        model,
-        base_url,
-        timeout,
-        temperature,
-        api_key,
-        seed
-    ):
-        """Run single-turn evaluation (agent must solve in one response)."""
-        # Get single LLM response
-        response = await self._llm_chat(
-            conversation, model, base_url, timeout, temperature, api_key, seed
-        )
-        conversation.append({"role": "assistant", "content": response})
-
-        # Process all queries first
-        for match in self.QUERY_PATTERN.finditer(response):
-            query_type = match.group(1).upper()
-            args = [int(match.group(2))]
-            if match.group(3):
-                args.append(int(match.group(3)))
-
-            try:
-                self.session_manager.query(challenge.session_id, query_type, args)
-            except ValueError:
-                pass  # Ignore errors in single-turn mode
-
-        # Evaluate submission
-        score = await task.evaluate(response, challenge)
-
-        # Get session state for detailed result
-        try:
-            state = self.session_manager.get_session_state(challenge.session_id)
-            final_result = {
-                "score": score,
-                "query_count": state.get("query_count", 0),
-                "total_bits": state.get("total_bits", 0),
-                "status": state.get("status", "unknown")
-            }
-        except:
-            final_result = {"score": score}
-
-        return score, final_result
-
-    async def create_session(
-        self,
-        n: int = 20,
-        seed: int = None,
-        method: str = "prufer"
-    ):
-        """Create a new session for external interaction.
-
-        This is useful for non-LLM agents or custom evaluation loops.
-
-        Args:
-            n: Number of nodes
-            seed: Random seed (uses random if not provided)
-            method: Generation method
-
-        Returns:
-            Dictionary with session_id and initial prompt
-        """
-        if seed is None:
-            seed = random.randint(0, 2**63 - 1)
-
-        task = TreeReconstructionTask(default_n=n, default_method=method)
-        challenge = await task.generate(n=n, seed=seed, method=method)
-
+    async def create_session(self, n: int = 20, seed: Optional[int] = None, method: str = "prufer"):
+        actual_seed = seed if seed is not None else random.randint(0, 2**63 - 1)
+        task = TreeReconstructionTask(default_n=n, default_method=method, session_manager=self.session_manager)
+        challenge = await task.generate(n=n, seed=actual_seed, method=method)
         return {
             "session_id": challenge.session_id,
             "n": n,
-            "seed": seed,
+            "seed": actual_seed,
             "prompt": challenge.prompt,
-            "info_lower_bound": challenge.extra["info_lower_bound"]
+            "info_lower_bound": challenge.extra["info_lower_bound"],
         }
 
     async def query(self, session_id: str, query_type: str, args: list):
-        """Execute a query on an existing session.
-
-        Args:
-            session_id: Session identifier
-            query_type: "ANCESTOR", "LCA", or "DEPTH"
-            args: Query arguments
-
-        Returns:
-            Query result dictionary
-        """
         return self.session_manager.query(session_id, query_type, args)
 
     async def submit(self, session_id: str, parent_array: list):
-        """Submit a reconstruction for an existing session.
-
-        Args:
-            session_id: Session identifier
-            parent_array: Parent array (length n, or n-1 without root)
-
-        Returns:
-            Evaluation result dictionary
-        """
-        # Handle both full array and array without root
         state = self.session_manager.get_session_state(session_id)
         n = state["n"]
-
-        if len(parent_array) == n - 1:
-            parent_array = [-1] + list(parent_array)
-
-        return self.session_manager.submit(session_id, parent_array)
+        normalized = [-1] + list(parent_array) if len(parent_array) == n - 1 else list(parent_array)
+        if len(normalized) != n:
+            raise ValueError(f"Expected {n-1} or {n} parent values, got {len(parent_array)}")
+        return self.session_manager.submit(session_id, normalized)
 
     async def get_ground_truth(self, session_id: str):
-        """Get ground truth for a session (for testing/debugging).
-
-        Args:
-            session_id: Session identifier
-
-        Returns:
-            Ground truth parent array
-        """
-        if session_id not in self.session_manager.sessions:
-            raise ValueError(f"Session not found: {session_id}")
+        self.session_manager.get_session_state(session_id)
         return self.session_manager.sessions[session_id].tree.get_ground_truth()
 
-    # ==================== Deduction Task (Recommended) ====================
-
+    # Deduction -----------------------------------------------------------
     async def evaluate_deduction(
         self,
         n: int = 8,
@@ -410,61 +278,34 @@ class Actor:
         base_url: str = "https://llm.chutes.ai/v1",
         timeout: int = 300,
         temperature: float = 0.7,
-        api_key: str = None,
-        seed: int = None,
-        task_id: int = None,
+        api_key: Optional[str] = None,
+        seed: Optional[int] = None,
+        task_id: Optional[int] = None,
     ):
-        """Run tree deduction evaluation (single-turn).
+        actual_seed = task_id if task_id is not None else (seed if seed is not None else random.randint(0, 2**32 - 1))
+        llm_seed = seed if seed is not None else actual_seed
+        config = self._llm_config(model, base_url, timeout, temperature, api_key, llm_seed)
 
-        The agent receives partial observations about a hidden tree and must
-        deduce the complete parent array. Tests constraint satisfaction and
-        logical deduction.
-
-        Args:
-            n: Number of nodes (default 8)
-            reveal_fraction: Fraction of edges revealed (default 0.5)
-                - 1.0 = trivial (all edges given)
-                - 0.5 = moderate (half edges, deduce rest)
-                - 0.0 = hard (only depths given)
-            model: Model name for evaluation
-            base_url: Base URL for LLM API
-            timeout: Timeout for LLM API call
-            temperature: Temperature for generation
-            api_key: Override API key
-            seed: Random seed for LLM generation
-            task_id: Task ID for deterministic generation
-
-        Returns:
-            Evaluation result dictionary
-        """
-        if seed is None:
-            seed = random.randint(0, 2**32 - 1)
-
-        current_api_key = api_key or self.api_key
-        actual_seed = task_id if task_id is not None else seed
-
-        # Create task and problem
         task = TreeDeductionTask(n=n, reveal_fraction=reveal_fraction)
-        problem = await task.generate(seed=actual_seed)
+        problem = await task.generate(n=n, reveal_fraction=reveal_fraction, seed=actual_seed, task_id=task_id)
+        prompt = problem.to_prompt()
 
         start = time.time()
-
         try:
-            messages = [{"role": "user", "content": problem.to_prompt()}]
-            response = await self._llm_chat(
-                messages, model, base_url, timeout, temperature, current_api_key, seed
-            )
-
+            messages = [{"role": "user", "content": prompt}]
+            response = await chat(messages, config)
             detailed = task.evaluate_detailed(response, problem)
             score = detailed["score"]
             error = None
-
-        except Exception as e:
+        except Exception as exc:  # pragma: no cover
             import traceback
+
             response = None
             score = 0.0
-            detailed = {"error": str(e)}
-            error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+            detailed = {"error": str(exc)}
+            error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+        finally:
+            gc.collect()
 
         result = {
             "task_name": "tree:deduction",
@@ -473,21 +314,22 @@ class Actor:
             "time_taken": time.time() - start,
             "extra": {
                 "conversation": [
-                    {"role": "user", "content": problem.to_prompt()},
-                    {"role": "assistant", "content": response}
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": response},
                 ],
                 "seed": actual_seed,
+                "llm_seed": llm_seed,
                 "n": n,
                 "reveal_fraction": reveal_fraction,
                 "ambiguity_bits": problem.ambiguity_bits,
                 "evaluation": detailed,
                 "ground_truth": problem.ground_truth,
-            }
+            },
         }
-
         if error:
             result["error"] = error
             result["error_type"] = "evaluation_failure"
-
-        gc.collect()
         return result
+
+
+__all__ = ["Actor"]

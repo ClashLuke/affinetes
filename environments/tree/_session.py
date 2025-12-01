@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from enum import Enum
 
-from _hidden_tree import HiddenTree, QueryResult
+from ._hidden_tree import HiddenTree, QueryResult
 
 
 class SessionStatus(Enum):
