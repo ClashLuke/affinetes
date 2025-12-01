@@ -152,7 +152,7 @@ class SessionManager:
             session_id=session_id,
             n=n,
             root=0,
-            available_queries=["ANCESTOR", "LCA", "DEPTH", "CHILDREN", "PATH"],
+            available_queries=tree.available_queries,
             info_lower_bound=tree.get_theoretical_lower_bound()
         )
 
@@ -174,30 +174,8 @@ class SessionManager:
         """
         state = self._get_active_session(session_id)
 
-        # Execute query
         query_type = query_type.upper()
-        if query_type == "ANCESTOR":
-            if len(args) != 2:
-                raise ValueError("ANCESTOR requires exactly 2 arguments")
-            result = state.tree.query_ancestor(args[0], args[1])
-        elif query_type == "LCA":
-            if len(args) != 2:
-                raise ValueError("LCA requires exactly 2 arguments")
-            result = state.tree.query_lca(args[0], args[1])
-        elif query_type == "DEPTH":
-            if len(args) != 1:
-                raise ValueError("DEPTH requires exactly 1 argument")
-            result = state.tree.query_depth(args[0])
-        elif query_type == "CHILDREN":
-            if len(args) != 1:
-                raise ValueError("CHILDREN requires exactly 1 argument")
-            result = state.tree.query_children(args[0])
-        elif query_type == "PATH":
-            if len(args) != 2:
-                raise ValueError("PATH requires exactly 2 arguments")
-            result = state.tree.query_path(args[0], args[1])
-        else:
-            raise ValueError(f"Unknown query type: {query_type}")
+        result = state.tree.run_query(query_type, args)
 
         # Record query
         record = QueryRecord(

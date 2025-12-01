@@ -233,53 +233,43 @@ Efficiency: {efficiency_str}"""
                 return (f"Error parsing submission: {e}", False, None)
 
         # Try to parse as query
-        query_match = self.QUERY_PATTERN.search(response)
-        if query_match:
-            query_type = query_match.group(1).upper()
+        query_matches = list(self.QUERY_PATTERN.finditer(response))
+        if query_matches:
+            outputs = []
+            for match in query_matches:
+                query_type = match.group(1).upper()
+                if query_type not in self.allowed_query_types:
+                    outputs.append(f"Error: Query type {query_type} not allowed. Available: {self.allowed_query_types}")
+                    continue
 
-            # Check if query type is allowed
-            if query_type not in self.allowed_query_types:
-                return (
-                    f"Error: Query type {query_type} not allowed. Available: {self.allowed_query_types}",
-                    False,
-                    None
-                )
+                state = self.session_manager.get_session_state(session_id)
+                if self.max_queries and state["query_count"] >= self.max_queries:
+                    outputs.append(f"Error: Query limit ({self.max_queries}) reached. You must submit your answer.")
+                    break
 
-            # Check query limit
-            state = self.session_manager.get_session_state(session_id)
-            if self.max_queries and state["query_count"] >= self.max_queries:
-                return (
-                    f"Error: Query limit ({self.max_queries}) reached. You must submit your answer.",
-                    False,
-                    None
-                )
+                args = [int(match.group(2))]
+                if match.group(3):
+                    args.append(int(match.group(3)))
 
-            # Parse arguments
-            args = [int(query_match.group(2))]
-            if query_match.group(3):
-                args.append(int(query_match.group(3)))
+                try:
+                    result = self.session_manager.query(session_id, query_type, args)
+                    if query_type == "ANCESTOR":
+                        answer = "YES" if result["result"] else "NO"
+                    elif query_type in ("CHILDREN", "PATH"):
+                        answer = "[" + ", ".join(map(str, result["result"])) + "]"
+                    else:
+                        answer = str(result["result"])
 
-            try:
-                result = self.session_manager.query(session_id, query_type, args)
+                    outputs.append(
+                        f"Query: {query_type} {' '.join(map(str, args))}\n"
+                        f"Result: {answer}\n"
+                        f"Total queries: {result['total_queries']}\n"
+                        f"Bits used: {result['total_bits']:.1f} / {result['info_lower_bound']:.1f} lower bound"
+                    )
+                except ValueError as e:
+                    outputs.append(f"Error: {e}")
 
-                # Format result based on query type
-                if query_type == "ANCESTOR":
-                    answer = "YES" if result["result"] else "NO"
-                elif query_type in ("CHILDREN", "PATH"):
-                    # Format list results nicely
-                    answer = "[" + ", ".join(map(str, result["result"])) + "]"
-                else:
-                    answer = str(result["result"])
-
-                msg = f"""Query: {query_type} {' '.join(map(str, args))}
-Result: {answer}
-Total queries: {result['total_queries']}
-Bits used: {result['total_bits']:.1f} / {result['info_lower_bound']:.1f} lower bound"""
-
-                return (msg, False, None)
-
-            except ValueError as e:
-                return (f"Error: {e}", False, None)
+            return ("\n\n".join(outputs), False, None)
 
         # Could not parse response
         return (

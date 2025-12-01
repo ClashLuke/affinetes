@@ -1,28 +1,26 @@
 """Hidden tree with query oracles for tree reconstruction.
 
 This module implements a principled tree reconstruction environment where:
-- Trees are generated uniformly at random using Prüfer sequences
-- Query oracles provide information about the hidden tree structure
-- Information complexity is tracked for theoretical analysis
+- Trees are generated from a deterministic seed
+- Query oracles expose partial structure
+- Information accounting accompanies each oracle
 
 Information-Theoretic Foundation:
 - There are n^(n-1) rooted labeled trees on n nodes (Cayley's formula)
-- Lower bound: Ω(n log n) bits of information needed
-- ANCESTOR queries provide 1 bit each
-- LCA queries provide O(log n) bits each
+- Rooted lower bound: (n-1) * log2(n) bits
+- ANCESTOR queries carry 1 bit, LCA/DEPTH/CHILDREN/PATH scale with structure
 """
 
 import random
 import math
-from typing import List, Tuple, Optional, Set
-from collections import deque
-from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Any, Sequence, Dict
+from dataclasses import dataclass
 
 
 @dataclass
 class QueryResult:
     """Result of a query with information accounting."""
-    result: any  # The actual query result
+    result: Any  # The actual query result
     bits: float  # Information bits revealed by this query
     query_type: str
     args: Tuple
@@ -65,8 +63,8 @@ class HiddenTree:
         self.n = n
         self.seed = seed
         self.method = method
+        self.root = 0
 
-        # Generate the tree
         rng = random.Random(seed)
         if method == "prufer":
             self.parent = self._generate_prufer(n, rng)
@@ -74,9 +72,8 @@ class HiddenTree:
             self.parent = self._generate_recursive(n, rng)
         else:
             raise ValueError(f"Unknown generation method: {method}")
-
-        # Precompute depth and children for efficient queries
         self._precompute()
+        self._init_dispatch()
 
     def _generate_prufer(self, n: int, rng: random.Random) -> List[int]:
         """Generate a tree uniformly at random using Prüfer sequence.
@@ -205,28 +202,49 @@ class HiddenTree:
         """Precompute auxiliary data structures for efficient queries."""
         n = self.n
 
-        # Compute depth for each node
-        self.depth = [0] * n
-        queue = deque([0])
-        while queue:
-            u = queue.popleft()
-            for v in range(n):
-                if self.parent[v] == u:
-                    self.depth[v] = self.depth[u] + 1
-                    queue.append(v)
-
-        # Compute children lists
-        self.children = [[] for _ in range(n)]
+        # children adjacency
+        self.children: List[List[int]] = [[] for _ in range(n)]
         for v in range(1, n):
-            self.children[self.parent[v]].append(v)
+            p = self.parent[v]
+            if p < 0 or p >= n:
+                raise ValueError(f"Invalid parent index {p} for node {v}")
+            self.children[p].append(v)
 
-        # Compute height (max depth)
+        # depth / euler tour for O(1) ancestor checks
+        self.depth = [0] * n
+        self._tin = [0] * n
+        self._tout = [0] * n
+        timer = 0
+        stack = [(self.root, True)]  # (node, entering)
+        while stack:
+            node, entering = stack.pop()
+            if entering:
+                self._tin[node] = timer
+                timer += 1
+                stack.append((node, False))
+                for child in reversed(self.children[node]):
+                    self.depth[child] = self.depth[node] + 1
+                    stack.append((child, True))
+            else:
+                self._tout[node] = timer
+                timer += 1
+
         self.height = max(self.depth)
 
         # Information bits per query type
         self._bits_per_ancestor = 1.0
         self._bits_per_lca = math.ceil(math.log2(n)) if n > 1 else 1
         self._bits_per_depth = math.ceil(math.log2(self.height + 1)) if self.height > 0 else 1
+
+    def _init_dispatch(self) -> None:
+        """Map query types to handlers and expected arity."""
+        self._handlers: Dict[str, Tuple[int, Any]] = {
+            "ANCESTOR": (2, self.query_ancestor),
+            "LCA": (2, self.query_lca),
+            "DEPTH": (1, self.query_depth),
+            "CHILDREN": (1, self.query_children),
+            "PATH": (2, self.query_path),
+        }
 
     # ==================== Query Oracles ====================
 
@@ -242,8 +260,6 @@ class HiddenTree:
         Note: A node is considered an ancestor of itself.
         """
         self._validate_nodes(u, v)
-
-        # Walk up from v to root, checking if we encounter u
         result = self._is_ancestor(u, v)
 
         return QueryResult(
@@ -316,10 +332,10 @@ class HiddenTree:
         self._validate_nodes(v)
 
         children = self.children[v].copy()
-        # Information: we learn the exact set of children
-        # Bits: log2(n choose k) where k = number of children, approximated as k * log2(n)
         num_children = len(children)
-        bits = num_children * math.ceil(math.log2(self.n)) if num_children > 0 else 1.0
+        # Encode: cost to specify degree (≈log2 n) + subset choice among remaining nodes
+        subset_bits = 0.0 if num_children == 0 else self._log2_comb(self.n - 1, num_children)
+        bits = max(math.log2(self.n) + subset_bits, 1.0)
 
         return QueryResult(
             result=children,
@@ -364,8 +380,8 @@ class HiddenTree:
         lca_idx = path_u.index(lca)
         path = path_u[:lca_idx + 1] + path_v[::-1]
 
-        # Information: path length * log2(n) bits
-        bits = len(path) * math.ceil(math.log2(self.n))
+        internal = max(len(path) - 2, 0)
+        bits = max(self._log2_perm(self.n - 2, internal), 1.0)
 
         return QueryResult(
             result=path,
@@ -376,18 +392,29 @@ class HiddenTree:
 
     def _is_ancestor(self, u: int, v: int) -> bool:
         """Check if u is an ancestor of v (internal, no validation)."""
-        current = v
-        while current != -1:
-            if current == u:
-                return True
-            current = self.parent[current]
-        return False
+        return self._tin[u] <= self._tin[v] <= self._tout[u]
 
     def _validate_nodes(self, *nodes):
         """Validate that all nodes are in valid range."""
         for node in nodes:
             if not (0 <= node < self.n):
                 raise ValueError(f"Node {node} out of range [0, {self.n})")
+
+    # ==================== Dispatch ====================
+
+    def run_query(self, query_type: str, args: Sequence[int]) -> QueryResult:
+        """Dispatch a query by type with basic arity validation."""
+        qtype = query_type.upper()
+        if qtype not in self._handlers:
+            raise ValueError(f"Unknown query type: {qtype}")
+        expected_arity, handler = self._handlers[qtype]
+        if len(args) != expected_arity:
+            raise ValueError(f"{qtype} requires {expected_arity} argument(s), got {len(args)}")
+        return handler(*args)
+
+    @property
+    def available_queries(self) -> List[str]:
+        return list(self._handlers.keys())
 
     # ==================== Evaluation ====================
 
@@ -439,12 +466,27 @@ class HiddenTree:
     def get_theoretical_lower_bound(self) -> float:
         """Get information-theoretic lower bound in bits.
 
-        For n nodes, there are (n-1) parent choices, each from up to n-1 options,
-        giving roughly n^(n-1) possible trees. The lower bound is:
-        log2(n^(n-1)) = (n-1) * log2(n) bits
+        For rooted labeled trees (Cayley): n^(n-1) possibilities.
+        log2(n^(n-1)) = (n-1) * log2(n) bits.
         """
         return (self.n - 1) * math.log2(self.n)
 
     def get_ground_truth(self) -> List[int]:
         """Return the ground truth parent array (for debugging/testing)."""
         return self.parent.copy()
+
+    # ==================== Helpers ====================
+
+    @staticmethod
+    def _log2_comb(n: int, k: int) -> float:
+        """Stable log2 of n choose k."""
+        if k < 0 or k > n:
+            return float("-inf")
+        return (math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)) / math.log(2)
+
+    @staticmethod
+    def _log2_perm(n: int, k: int) -> float:
+        """Stable log2 of permutations nPk."""
+        if k < 0 or k > n:
+            return float("-inf")
+        return (math.lgamma(n + 1) - math.lgamma(n - k + 1)) / math.log(2)

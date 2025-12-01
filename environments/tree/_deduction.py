@@ -3,7 +3,8 @@
 import random
 import math
 import re
-from typing import List, Tuple, Optional, Dict, Set
+import hashlib
+from typing import List, Optional, Dict
 from dataclasses import dataclass, field
 from collections import defaultdict
 
@@ -151,19 +152,17 @@ def count_consistent_trees(obs: TreeObservations) -> int:
     return count_assignments(0)
 
 
-def compute_ambiguity(obs: TreeObservations) -> float:
-    """Compute log2 of number of consistent trees (ambiguity in bits).
+def compute_ambiguity_upper_bound(obs: TreeObservations) -> float:
+    """Upper bound on ambiguity (log2 of consistent assignments assuming independence).
 
-    This measures how much uncertainty remains after observations.
-    - 0 bits = observations uniquely determine the tree
-    - Higher = more ambiguous
+    Assumes each hidden node chooses any parent at depth-1 independently.
+    This overestimates the true count but is fast and monotone.
     """
-    # For each hidden node, count candidate parents
     total_bits = 0.0
     for node in obs.hidden_nodes:
-        num_candidates = len(obs.candidate_parents(node))
-        if num_candidates > 0:
-            total_bits += math.log2(num_candidates)
+        candidates = len(obs.candidate_parents(node))
+        if candidates:
+            total_bits += math.log2(candidates)
     return total_bits
 
 
@@ -175,7 +174,7 @@ class DeductionProblem:
     reveal_fraction: float
     observations: TreeObservations
     ground_truth: List[int]  # The actual parent array
-    ambiguity_bits: float  # Remaining uncertainty
+    ambiguity_bits: float  # Remaining uncertainty (upper bound in bits)
 
     def to_prompt(self) -> str:
         """Generate the full problem prompt."""
@@ -220,11 +219,10 @@ def generate_problem(
     # Generate tree
     tree = HiddenTree(n, seed, method="prufer")
 
-    # Generate observations with derived seed
-    obs = generate_observations(tree, reveal_fraction, seed=seed + 1_000_000)
+    obs_seed = _derive_seed(seed, "observations")
+    obs = generate_observations(tree, reveal_fraction, seed=obs_seed)
 
-    # Compute ambiguity
-    ambiguity = compute_ambiguity(obs)
+    ambiguity = compute_ambiguity_upper_bound(obs)
 
     return DeductionProblem(
         n=n,
@@ -252,7 +250,6 @@ def evaluate_answer(answer: List[int], problem: DeductionProblem) -> dict:
             "error": f"Expected {problem.n} values, got {len(answer)}"
         }
 
-    # Check only the hidden nodes (revealed ones are given)
     hidden = problem.observations.hidden_nodes
     correct = sum(
         1 for node in hidden
@@ -341,3 +338,13 @@ class TreeDeductionTask:
         if len(values) > n:
             return values[:n]
         return values + [-1] * (n - len(values))
+
+
+# Compatibility alias
+compute_ambiguity = compute_ambiguity_upper_bound
+
+
+def _derive_seed(seed: int, salt: str) -> int:
+    """Deterministic child seed derived from a base seed and salt."""
+    digest = hashlib.sha256(f"{seed}:{salt}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
